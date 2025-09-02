@@ -1,0 +1,5 @@
+opencv-python
+requests
+ultralytics
+keyboard
+win10toast; sys_platform == 'win32'
