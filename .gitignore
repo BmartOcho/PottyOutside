@@ -1,0 +1,15 @@
+# Build + env
+.vscode/
+.venv/
+__pycache__/
+*.pyc
+
+# App outputs
+foscam_output/
+*.avi
+*.mp4
+*.mov
+*.jpg
+*.jpeg
+*.png
+roi_config.json
