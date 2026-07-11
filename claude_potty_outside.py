@@ -1,16 +1,24 @@
 """
-PuppyCam — dual USB webcam dog-at-the-door detector.
+PuppyCam — USB webcam dog-at-the-door detector.
 
-Two local USB webcams, one detection ROI each:
-  * Camera A (index 0) watches the INSIDE of the door.
-  * Camera B (index 1) watches the OUTSIDE, through the glass.
+Two detection zones, each with its own ROI:
+  * INSIDE  — a dog at the door wanting to go OUT.
+  * OUTSIDE — a dog at the door (through the glass) wanting to come IN.
+
+Two camera layouts, chosen in .env:
+  * TWO cameras   — CAM_INSIDE_INDEX=0, CAM_OUTSIDE_INDEX=1 (one camera per zone,
+                    side-by-side panes; draw each zone's ROI in its own pane).
+  * ONE camera    — CAM_INSIDE_INDEX == CAM_OUTSIDE_INDEX, or SINGLE_CAM=1. The
+                    device is opened once and BOTH ROIs live on that single frame.
+                    The preview is one pane and the ROI editor draws two rects on
+                    it in order: first rect = INSIDE, second rect = OUTSIDE.
 
 YOLOv8 finds dogs; a per-zone persistence buffer + cooldown decides when to
-fire a Telegram alert. A side-by-side preview window lets you draw/adjust the
-ROI on each camera independently.
+fire a Telegram alert.
 
 Keys (focus the preview window):
-  G  enter ROI edit mode   (draw a box in either pane; Enter saves, Esc cancels)
+  G  enter ROI edit mode   (two cams: draw in each pane; one cam: 1st=INSIDE,
+                            2nd=OUTSIDE; Enter saves, Esc cancels)
   T  save a snapshot of the current side-by-side view
   R  toggle recording of the side-by-side view
   M  send a manual test notification
@@ -70,7 +78,14 @@ except Exception:
 CAM_INSIDE_INDEX = int(os.environ.get("CAM_INSIDE_INDEX", "0"))
 CAM_OUTSIDE_INDEX = int(os.environ.get("CAM_OUTSIDE_INDEX", "1"))
 
-# One camera -> one zone -> one ROI.
+# Single-camera mode: both zones share ONE device (two ROIs on one frame).
+# Active when SINGLE_CAM=1 (env) or when both indices are the same.
+SINGLE_CAM = (os.environ.get("SINGLE_CAM", "").strip().lower() in ("1", "true", "yes", "on")
+              or CAM_INSIDE_INDEX == CAM_OUTSIDE_INDEX)
+if SINGLE_CAM:
+    CAM_OUTSIDE_INDEX = CAM_INSIDE_INDEX  # both zones read the same device
+
+# One zone -> one ROI. In single-cam mode both entries point at the same device.
 CAMERAS = [
     {"zone": "inside", "index": CAM_INSIDE_INDEX, "label": "INSIDE", "color": (0, 165, 255)},   # orange
     {"zone": "outside", "index": CAM_OUTSIDE_INDEX, "label": "OUTSIDE (glass)", "color": (255, 0, 0)},  # blue
@@ -127,9 +142,10 @@ next_frame_due = 0.0
 roi_edit_mode = False
 pending = {z: None for z in ZONES}   # normalized rects drawn during the current edit session
 dragging = False
-drag_zone = None                     # which pane the current drag started in
+drag_zone = None                     # zone the current drag targets
 drag_start = None                    # (x, y) in local pane display coords
 drag_cur = None                      # current mouse pos in local pane display coords
+single_draw_count = 0                # single-cam: rects drawn this session (0->INSIDE, 1->OUTSIDE)
 
 
 # ============== Telegram / notifications ==============
@@ -285,19 +301,48 @@ def point_in_rect(cx, cy, rect):
 
 # ============== ROI editor (mouse) ==============
 
+def _clamp_pt(x, y):
+    """Clamp a point to the display pane bounds."""
+    return (max(0, min(DISPLAY_W - 1, x)), max(0, min(DISPLAY_H - 1, y)))
+
+
 def _to_local(x, y, zone):
     """Map combined-window coords -> local pane coords for the given zone, clamped."""
     lx = x - DISPLAY_W if zone == "outside" else x
-    lx = max(0, min(DISPLAY_W - 1, lx))
-    ly = max(0, min(DISPLAY_H - 1, y))
-    return lx, ly
+    return _clamp_pt(lx, y)
 
 
 def mouse_cb(event, x, y, flags, param):
-    global dragging, drag_zone, drag_start, drag_cur, pending
+    global dragging, drag_zone, drag_start, drag_cur, pending, single_draw_count
     if not roi_edit_mode:
         return
 
+    if SINGLE_CAM:
+        # One pane: draw rects in order — 1st = INSIDE, 2nd = OUTSIDE (then repeat).
+        if event == cv2.EVENT_LBUTTONDOWN:
+            dragging = True
+            drag_zone = ZONES[single_draw_count % 2]
+            drag_start = _clamp_pt(x, y)
+            drag_cur = drag_start
+        elif event == cv2.EVENT_MOUSEMOVE and dragging:
+            drag_cur = _clamp_pt(x, y)
+        elif event == cv2.EVENT_LBUTTONUP and dragging:
+            dragging = False
+            x1, y1 = drag_start
+            x2, y2 = _clamp_pt(x, y)
+            nx1, nx2 = sorted([x1 / DISPLAY_W, x2 / DISPLAY_W])
+            ny1, ny2 = sorted([y1 / DISPLAY_H, y2 / DISPLAY_H])
+            if (nx2 - nx1) > 0.01 and (ny2 - ny1) > 0.01:
+                zone = ZONES[single_draw_count % 2]
+                pending[zone] = [nx1, ny1, nx2, ny2]
+                single_draw_count += 1
+                nxt = ZONES[single_draw_count % 2].upper()
+                print(f"ROI set for {zone.upper()}: {pending[zone]}  (next draw -> {nxt})")
+            drag_start = None
+            drag_cur = None
+        return
+
+    # Two-camera mode: the pane under the cursor picks the zone.
     if event == cv2.EVENT_LBUTTONDOWN:
         drag_zone = "inside" if x < DISPLAY_W else "outside"
         dragging = True
@@ -319,10 +364,14 @@ def mouse_cb(event, x, y, flags, param):
 
 
 def enter_roi_edit():
-    global roi_edit_mode, pending
+    global roi_edit_mode, pending, single_draw_count
     pending = {z: rois[z] for z in ZONES}
+    single_draw_count = 0
     roi_edit_mode = True
-    print("ROI edit mode: draw a box in either pane. Enter=save, Esc=cancel.")
+    if SINGLE_CAM:
+        print("ROI edit (single cam): draw INSIDE rect first, then OUTSIDE. Enter=save, Esc=cancel.")
+    else:
+        print("ROI edit mode: draw a box in each pane. Enter=save, Esc=cancel.")
 
 
 # ============== Detection ==============
@@ -468,6 +517,41 @@ def render_pane(cam, frame, dog_centers):
     return disp
 
 
+def render_single_pane(frame, dog_centers):
+    """Single-camera view: one pane with BOTH zone ROIs drawn on the same frame."""
+    h, w = frame.shape[:2]
+    disp = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
+    sx, sy = DISPLAY_W / w, DISPLAY_H / h
+
+    # Detected dog centers (shared by both zones)
+    for (cx, cy, conf) in dog_centers:
+        px, py = int(cx * sx), int(cy * sy)
+        cv2.circle(disp, (px, py), 6, (0, 255, 0), 2)
+        cv2.putText(disp, f"dog {conf:.2f}", (px + 6, py - 6), FONT, 0.5, (0, 255, 0), 1)
+
+    for cam in CAMERAS:
+        zone, color, label = cam["zone"], cam["color"], cam["label"]
+        # Saved ROI
+        if rois[zone]:
+            x1, y1, x2, y2 = denorm_rect(rois[zone], DISPLAY_W, DISPLAY_H)
+            cv2.rectangle(disp, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(disp, label.split()[0], (x1, max(15, y1 - 5)), FONT, 0.5, color, 2)
+        # Pending edit rect
+        if roi_edit_mode and pending[zone]:
+            x1, y1, x2, y2 = denorm_rect(pending[zone], DISPLAY_W, DISPLAY_H)
+            cv2.rectangle(disp, (x1, y1), (x2, y2), color, 1)
+
+    # Live rubber-band, colored by the zone being drawn
+    if roi_edit_mode and dragging and drag_start and drag_cur:
+        rb_color = CAMERAS[0]["color"] if drag_zone == "inside" else CAMERAS[1]["color"]
+        cv2.rectangle(disp, drag_start, drag_cur, rb_color, 1)
+
+    # Header label
+    cv2.rectangle(disp, (0, 0), (DISPLAY_W, 26), (40, 40, 40), -1)
+    cv2.putText(disp, "SINGLE CAM: INSIDE + OUTSIDE", (8, 19), FONT, 0.55, (255, 255, 255), 1)
+    return disp
+
+
 # ============== Main loop ==============
 
 def main():
@@ -487,39 +571,77 @@ def main():
     else:
         print("Ultralytics not installed — dog detection disabled. Install with: pip install ultralytics")
 
-    caps = {}
+    # Open each UNIQUE camera index once, so two zones can share one camera.
+    # Set CAM_INSIDE_INDEX == CAM_OUTSIDE_INDEX for single-camera dual-zone
+    # (two ROIs on one view, like the old Foscam setup).
+    caps = {}  # keyed by camera index
     for cam in CAMERAS:
-        cap = cv2.VideoCapture(cam["index"])
-        if not cap.isOpened():
-            print(f"⚠️  Could not open camera index {cam['index']} for {cam['zone'].upper()} zone.")
+        idx = cam["index"]
+        if idx in caps:
+            continue
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            print(f"Camera {idx} opened.")
         else:
-            print(f"Camera {cam['index']} opened for {cam['zone'].upper()} zone.")
-        caps[cam["zone"]] = cap
+            print(f"⚠️  Could not open camera index {idx}.")
+        caps[idx] = cap
+
+    if SINGLE_CAM:
+        print(f"SINGLE-CAMERA dual-zone mode: both zones read camera {CAM_INSIDE_INDEX}.")
+    else:
+        print("TWO-CAMERA mode: one camera per zone.")
 
     cv2.namedWindow(WINDOW)
     cv2.setMouseCallback(WINDOW, mouse_cb)
 
     try:
         while True:
-            panes = []
-            for cam in CAMERAS:
-                zone = cam["zone"]
-                ok, frame = caps[zone].read()
-                if not ok or frame is None:
-                    panes.append(placeholder_pane(f"{cam['label']}: NO SIGNAL"))
-                    continue
+            # Read each unique camera once; run detection once per camera frame
+            # (so zones sharing a camera reuse the same frame + detections).
+            frame_by_index = {}
+            for idx, cap in caps.items():
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    frame_by_index[idx] = frame
 
-                dog_centers = detect_dogs(frame) if (YOLO_AVAILABLE and rois[zone]) else []
-                if rois[zone]:
-                    update_presence_and_alert(zone, dog_centers, frame.shape[1], frame.shape[0])
-                panes.append(render_pane(cam, frame, dog_centers))
+            dets_by_index = {}
+            for idx, frame in frame_by_index.items():
+                zones_on_cam = [c["zone"] for c in CAMERAS if c["index"] == idx]
+                need_detect = YOLO_AVAILABLE and any(rois[z] for z in zones_on_cam)
+                dets_by_index[idx] = detect_dogs(frame) if need_detect else []
 
-            combined = cv2.hconcat(panes)
+            if SINGLE_CAM:
+                frame = frame_by_index.get(CAM_INSIDE_INDEX)
+                if frame is None:
+                    combined = placeholder_pane("SINGLE CAM: NO SIGNAL")
+                else:
+                    dog_centers = dets_by_index.get(CAM_INSIDE_INDEX, [])
+                    for zone in ZONES:
+                        if rois[zone]:
+                            update_presence_and_alert(zone, dog_centers, frame.shape[1], frame.shape[0])
+                    combined = render_single_pane(frame, dog_centers)
+            else:
+                panes = []
+                for cam in CAMERAS:
+                    zone, idx = cam["zone"], cam["index"]
+                    frame = frame_by_index.get(idx)
+                    if frame is None:
+                        panes.append(placeholder_pane(f"{cam['label']}: NO SIGNAL"))
+                        continue
+
+                    dog_centers = dets_by_index.get(idx, [])
+                    if rois[zone]:
+                        update_presence_and_alert(zone, dog_centers, frame.shape[1], frame.shape[0])
+                    panes.append(render_pane(cam, frame, dog_centers))
+
+                combined = cv2.hconcat(panes)
 
             # Status banner
             if roi_edit_mode:
-                cv2.putText(combined, "ROI EDIT — draw in a pane, Enter=save, Esc=cancel",
-                            (8, DISPLAY_H - 12), FONT, 0.6, (0, 255, 255), 2)
+                banner = ("ROI EDIT — 1st rect=INSIDE, 2nd=OUTSIDE | Enter=save, Esc=cancel"
+                          if SINGLE_CAM else
+                          "ROI EDIT — draw in each pane | Enter=save, Esc=cancel")
+                cv2.putText(combined, banner, (8, DISPLAY_H - 12), FONT, 0.5, (0, 255, 255), 2)
             if is_recording:
                 cv2.circle(combined, (combined.shape[1] - 20, 20), 8, (0, 0, 255), -1)
 
