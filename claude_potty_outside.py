@@ -1,13 +1,19 @@
 """
-PuppyCam — dual USB webcam dog-at-the-door detector.
+PuppyCam — USB webcam dog-at-the-door detector.
 
-Two local USB webcams, one detection ROI each:
-  * Camera A (index 0) watches the INSIDE of the door.
-  * Camera B (index 1) watches the OUTSIDE, through the glass.
+Two detection zones, each with its own ROI:
+  * INSIDE  — a dog at the door wanting to go OUT.
+  * OUTSIDE — a dog at the door (through the glass) wanting to come IN.
+
+Two camera layouts, chosen in .env:
+  * TWO cameras   — CAM_INSIDE_INDEX=0, CAM_OUTSIDE_INDEX=1 (one camera per zone).
+  * ONE camera    — CAM_INSIDE_INDEX=0, CAM_OUTSIDE_INDEX=0 (both zones share one
+                    view; draw the INSIDE ROI on the left pane and the OUTSIDE ROI
+                    on the right pane — the panes show the same camera).
 
 YOLOv8 finds dogs; a per-zone persistence buffer + cooldown decides when to
 fire a Telegram alert. A side-by-side preview window lets you draw/adjust the
-ROI on each camera independently.
+ROI for each zone independently.
 
 Keys (focus the preview window):
   G  enter ROI edit mode   (draw a box in either pane; Enter saves, Esc cancels)
@@ -487,29 +493,54 @@ def main():
     else:
         print("Ultralytics not installed — dog detection disabled. Install with: pip install ultralytics")
 
-    caps = {}
+    # Open each UNIQUE camera index once, so two zones can share one camera.
+    # Set CAM_INSIDE_INDEX == CAM_OUTSIDE_INDEX for single-camera dual-zone
+    # (two ROIs on one view, like the old Foscam setup).
+    caps = {}  # keyed by camera index
     for cam in CAMERAS:
-        cap = cv2.VideoCapture(cam["index"])
-        if not cap.isOpened():
-            print(f"⚠️  Could not open camera index {cam['index']} for {cam['zone'].upper()} zone.")
+        idx = cam["index"]
+        if idx in caps:
+            continue
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            print(f"Camera {idx} opened.")
         else:
-            print(f"Camera {cam['index']} opened for {cam['zone'].upper()} zone.")
-        caps[cam["zone"]] = cap
+            print(f"⚠️  Could not open camera index {idx}.")
+        caps[idx] = cap
+
+    if len({c["index"] for c in CAMERAS}) == 1:
+        print(f"SINGLE-CAMERA dual-zone mode: both zones read camera {CAMERAS[0]['index']}.")
+    else:
+        print("TWO-CAMERA mode: one camera per zone.")
 
     cv2.namedWindow(WINDOW)
     cv2.setMouseCallback(WINDOW, mouse_cb)
 
     try:
         while True:
+            # Read each unique camera once; run detection once per camera frame
+            # (so zones sharing a camera reuse the same frame + detections).
+            frame_by_index = {}
+            for idx, cap in caps.items():
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    frame_by_index[idx] = frame
+
+            dets_by_index = {}
+            for idx, frame in frame_by_index.items():
+                zones_on_cam = [c["zone"] for c in CAMERAS if c["index"] == idx]
+                need_detect = YOLO_AVAILABLE and any(rois[z] for z in zones_on_cam)
+                dets_by_index[idx] = detect_dogs(frame) if need_detect else []
+
             panes = []
             for cam in CAMERAS:
-                zone = cam["zone"]
-                ok, frame = caps[zone].read()
-                if not ok or frame is None:
+                zone, idx = cam["zone"], cam["index"]
+                frame = frame_by_index.get(idx)
+                if frame is None:
                     panes.append(placeholder_pane(f"{cam['label']}: NO SIGNAL"))
                     continue
 
-                dog_centers = detect_dogs(frame) if (YOLO_AVAILABLE and rois[zone]) else []
+                dog_centers = dets_by_index.get(idx, [])
                 if rois[zone]:
                     update_presence_and_alert(zone, dog_centers, frame.shape[1], frame.shape[0])
                 panes.append(render_pane(cam, frame, dog_centers))
