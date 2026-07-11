@@ -1,5 +1,6 @@
 opencv-python
+numpy
 requests
 ultralytics
-keyboard
+python-dotenv
 win10toast; sys_platform == 'win32'

@@ -4,8 +4,12 @@
 __pycache__/
 *.pyc
 
+# Secrets
+.env
+
 # App outputs
 foscam_output/
+puppycam_output/
 *.avi
 *.mp4
 *.mov
